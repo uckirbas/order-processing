@@ -1,0 +1,23 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Contracts/Contracts.csproj" />
+  </Folder>
+  <Folder Name="/src/BuildingBlocks/">
+    <Project Path="src/BuildingBlocks/BuildingBlocks.Messaging/BuildingBlocks.Messaging.csproj" />
+    <Project Path="src/BuildingBlocks/BuildingBlocks/BuildingBlocks.csproj" />
+  </Folder>
+  <Folder Name="/src/Invoicing/">
+    <Project Path="src/Invoicing/Invoicing.Worker/Invoicing.Worker.csproj" />
+  </Folder>
+  <Folder Name="/src/Notification/">
+    <Project Path="src/Notification/Notification.Worker/Notification.Worker.csproj" />
+  </Folder>
+  <Folder Name="/src/Ordering/">
+    <Project Path="src/Ordering/Ordering.Api/Ordering.Api.csproj" />
+    <Project Path="src/Ordering/Ordering.Infrastructure/Ordering.Infrastructure.csproj" />
+    <Project Path="src/Ordering/Ordering.Worker/Ordering.Worker.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Ordering.Api.IntegrationTests/Ordering.Api.IntegrationTests.csproj" />
+  </Folder>
+</Solution>

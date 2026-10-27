@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Cross-cutting persistence pieces: outbox table/store, id generation, shared EF provider settings.
+       Deliberately free of any message-broker dependency so Ordering.Api never references RabbitMQ. -->
+
+  <ItemGroup>
+    <PackageReference Include="EFCore.NamingConventions" />
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" />
+  </ItemGroup>
+
+</Project>

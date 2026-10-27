@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Versioned integration event contracts shared between services. No dependencies by design. -->
+
+</Project>

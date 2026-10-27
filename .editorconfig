@@ -1,0 +1,40 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+indent_style = space
+indent_size = 4
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.{json,yml,yaml,xml,csproj,props,targets,slnx}]
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false
+
+[*.cs]
+csharp_style_namespace_declarations = file_scoped:warning
+csharp_style_var_for_built_in_types = true:suggestion
+csharp_style_var_when_type_is_apparent = true:suggestion
+csharp_prefer_braces = when_multiline:suggestion
+dotnet_sort_system_directives_first = true
+
+# --- Async / concurrency correctness, enforced as build errors (see DESIGN.md, "Thread-safety") ---
+
+# Synchronous call inside an async method when an async overload exists (sync-over-async starves the ThreadPool).
+dotnet_diagnostic.CA1849.severity = error
+# ValueTask awaited twice / concurrently or not awaited at all.
+dotnet_diagnostic.CA2012.severity = error
+# CancellationToken available but not forwarded (shutdown and timeouts would not propagate).
+dotnet_diagnostic.CA2016.severity = error
+# Interpolated string passed to a *Raw* EF Core SQL API (SQL injection).
+dotnet_diagnostic.EF1002.severity = error
+
+# ASP.NET Core and generic host have no SynchronizationContext; ConfigureAwait(false) is noise here.
+dotnet_diagnostic.CA2007.severity = none
+
+# EF Core migrations are tool-generated.
+[**/Migrations/*.cs]
+generated_code = true

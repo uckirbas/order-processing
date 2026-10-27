@@ -1,0 +1,93 @@
+# Local environment. Infrastructure only for now; application services are added phase by phase
+# (see DESIGN.md, "Yol haritası"). All credentials below are for local development only.
+
+name: order-processing
+
+services:
+  postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=2GB
+      - -c
+      - max_wal_size=2GB
+      - -c
+      - random_page_cost=1.1
+      # Durability is not traded for throughput: an acknowledged order must survive a crash.
+      - -c
+      - synchronous_commit=on
+      - -c
+      - log_min_duration_statement=250
+    ports:
+      # Host ports are offset (15432/16432) so they don't clash with other local PostgreSQL instances.
+      - "${POSTGRES_HOST_PORT:-15432}:5432"
+    volumes:
+      # PostgreSQL 18 images keep PGDATA under /var/lib/postgresql/18/docker; mount the parent.
+      - pgdata:/var/lib/postgresql
+      - ./deploy/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.26.0-p0
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${PGBOUNCER_HOST_PORT:-16432}:6432"
+    volumes:
+      - ./deploy/pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./deploy/pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U ordering_svc -d ordering"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:4.3.6-management-alpine
+    # Stable node name, so the data volume is reused across container restarts.
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: orderprocessing
+      RABBITMQ_DEFAULT_PASS: orderprocessing
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+      # Shovel powers "Move messages" in the management UI: the DLQ replay procedure in the README.
+      - ./deploy/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  mailpit:
+    image: axllent/mailpit:v1.31.4
+    environment:
+      # Default keeps only 500 messages; load tests produce far more.
+      MP_MAX_MESSAGES: 50000
+      # Lets tests make the SMTP server answer with chosen error codes (e.g. 451 transient, 550 permanent)
+      # through PUT /api/v1/chaos, to exercise retry, circuit breaker and DLQ paths without stopping the server.
+      MP_ENABLE_CHAOS: "true"
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+volumes:
+  pgdata:
+  rabbitmqdata:

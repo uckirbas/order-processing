@@ -1,0 +1,77 @@
+{
+  "version": "0.2.0",
+  // Start "All services" from the Run and Debug view. The single-service entries are hidden and only used by the
+  // compounds, which build the solution once up front (four parallel builds of shared projects would collide).
+  // Consumers run with concurrency 1 / prefetch 1 here, so a breakpoint stops one message at a time.
+  "configurations": [
+    {
+      "name": "Ordering.Api",
+      "type": "coreclr",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/Ordering/Ordering.Api/bin/Debug/net10.0/Ordering.Api.dll",
+      "cwd": "${workspaceFolder}/src/Ordering/Ordering.Api",
+      "env": {
+        "ASPNETCORE_ENVIRONMENT": "Development",
+        "ASPNETCORE_URLS": "http://localhost:5080"
+      },
+      "presentation": { "hidden": true }
+    },
+    {
+      "name": "Ordering.Worker",
+      "type": "coreclr",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/Ordering/Ordering.Worker/bin/Debug/net10.0/Ordering.Worker.dll",
+      "cwd": "${workspaceFolder}/src/Ordering/Ordering.Worker",
+      "env": {
+        "DOTNET_ENVIRONMENT": "Development",
+        "Consumers__InvoiceGenerated__Concurrency": "1",
+        "Consumers__InvoiceGenerated__Prefetch": "1",
+        "Consumers__InvoiceFailed__Concurrency": "1",
+        "Consumers__InvoiceFailed__Prefetch": "1"
+      },
+      "presentation": { "hidden": true }
+    },
+    {
+      "name": "Invoicing.Worker",
+      "type": "coreclr",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/Invoicing/Invoicing.Worker/bin/Debug/net10.0/Invoicing.Worker.dll",
+      "cwd": "${workspaceFolder}/src/Invoicing/Invoicing.Worker",
+      "env": {
+        "DOTNET_ENVIRONMENT": "Development",
+        "Consumers__OrderPlaced__Concurrency": "1",
+        "Consumers__OrderPlaced__Prefetch": "1"
+      },
+      "presentation": { "hidden": true }
+    },
+    {
+      "name": "Notification.Worker",
+      "type": "coreclr",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/Notification/Notification.Worker/bin/Debug/net10.0/Notification.Worker.dll",
+      "cwd": "${workspaceFolder}/src/Notification/Notification.Worker",
+      "env": {
+        "DOTNET_ENVIRONMENT": "Development",
+        "Consumers__OrderPlaced__Concurrency": "1",
+        "Consumers__OrderPlaced__Prefetch": "1",
+        "Consumers__InvoiceGenerated__Concurrency": "1",
+        "Consumers__InvoiceGenerated__Prefetch": "1"
+      },
+      "presentation": { "hidden": true }
+    }
+  ],
+  "compounds": [
+    {
+      "name": "All services",
+      "configurations": ["Ordering.Api", "Ordering.Worker", "Invoicing.Worker", "Notification.Worker"],
+      "preLaunchTask": "build",
+      "stopAll": true
+    },
+    {
+      "name": "Ordering only (Api + Worker)",
+      "configurations": ["Ordering.Api", "Ordering.Worker"],
+      "preLaunchTask": "build",
+      "stopAll": true
+    }
+  ]
+}

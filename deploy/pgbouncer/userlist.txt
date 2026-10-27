@@ -1,0 +1,4 @@
+"postgres" "postgres"
+"ordering_svc" "ordering_svc_pwd"
+"invoicing_svc" "invoicing_svc_pwd"
+"notification_svc" "notification_svc_pwd"
