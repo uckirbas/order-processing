@@ -4,7 +4,7 @@ using Ordering.Infrastructure.Orders;
 
 namespace Ordering.Infrastructure.Persistence;
 
-/// <summary>Not thread-safe: one instance per request (API) or per message (worker), never shared.</summary>
+/// <summary>Not thread-safe: one instance per request (API) or per batch (worker), never shared.</summary>
 public sealed class OrderingDbContext(DbContextOptions<OrderingDbContext> options) : DbContext(options)
 {
     /// <summary>Unique index behind API idempotency; its name is how a duplicate request is recognised.</summary>

@@ -1,0 +1,31 @@
+# Compose override: the workers without batching, for comparison with the default (batched) settings.
+#   docker compose -f docker-compose.yml -f loadtest/per-message.yml --profile app up -d
+# MaxBatchSize 1 = one message per handler call. Concurrency is raised to about what the batched settings keep in
+# flight, so the comparison isolates batching rather than parallelism.
+
+services:
+  ordering-worker:
+    environment:
+      Consumers__InvoiceGenerated__MaxBatchSize: 1
+      Consumers__InvoiceGenerated__MaxBatchDelay: "00:00:00"
+      Consumers__InvoiceGenerated__Concurrency: 32
+      Consumers__InvoiceGenerated__Prefetch: 64
+      Consumers__InvoiceFailed__MaxBatchSize: 1
+
+  invoicing-worker:
+    environment:
+      Consumers__OrderPlaced__MaxBatchSize: 1
+      Consumers__OrderPlaced__MaxBatchDelay: "00:00:00"
+      Consumers__OrderPlaced__Concurrency: 32
+      Consumers__OrderPlaced__Prefetch: 64
+
+  notification-worker:
+    environment:
+      Consumers__OrderPlaced__MaxBatchSize: 1
+      Consumers__OrderPlaced__MaxBatchDelay: "00:00:00"
+      Consumers__OrderPlaced__Concurrency: 64
+      Consumers__OrderPlaced__Prefetch: 128
+      Consumers__InvoiceGenerated__MaxBatchSize: 1
+      Consumers__InvoiceGenerated__MaxBatchDelay: "00:00:00"
+      Consumers__InvoiceGenerated__Concurrency: 64
+      Consumers__InvoiceGenerated__Prefetch: 128

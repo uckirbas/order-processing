@@ -436,11 +436,11 @@ Kapanışta consumer önce yeni mesaj almayı keser, işlenmekte olanlara 10 sn 
 | Npgsql pool (pod başına) | ordering-api 20, ordering-worker 5, invoicing 8, notification 8. Connection `Timeout` kısa (~2 sn) |
 | PgBouncer (transaction mode) | Database başına server pool: ordering 40, invoicing 15, notification 15. `query_wait_timeout = 5 s` |
 | PostgreSQL role'leri | `CONNECTION LIMIT`: pool'ların arkasında ikinci bir bulkhead |
-| Load shedding | ASP.NET Core concurrency limiter; aşırı yükte istekler sonsuz kuyruğa alınmak yerine hızla `503` alır |
+| Load shedding | ASP.NET Core concurrency limiter, kopya başına 64 eşzamanlı istek + 256'lık kuyruk; kuyruk doluysa istek anında `503` alır. Sınır istek hızına göre değil DB havuzuna (20) göre ayarlı; gerekçe ve k6 bulgusu aşağıda |
 | Hot path | Tek `SaveChangesAsync` (EF batching ile tek round-trip), UUIDv7 (B-tree'de sıralı ekleme), `AddDbContextPool`, System.Text.Json source generation |
 | Dayanıklılık | `synchronous_commit = on`: onaylanan sipariş crash'te kaybolmaz; throughput için durability'den taviz verilmiyor |
 
-**Pod sayısı:** API tepe yükü karşılamak zorunda: `N = ceil(8000 / (pod_kapasitesi × 0.7)) + 1`. 2 vCPU'luk pod'larla ilk tahmin 4; kesin sayı k6 ölçümüyle belirlenir. Worker'lar ise tepe yüke yetişmek zorunda değil: kampanya anında mesajlar kuyrukta birikir, worker'lar kendi hızlarında eritir. Worker'lar **ortalama yük ve kabul edilebilir gecikmeye** göre boyutlandırılır ve kuyruk derinliğine göre ölçeklenir. Lokalde her servisten 2 replica çalışır; amaç kapasite değil, eşzamanlılık tasarımının (SKIP LOCKED, lease, competing consumers) gerçekten çalıştığını göstermek.
+**Pod sayısı:** API tepe yükü karşılamak zorunda: `N = ceil(8000 / (pod_kapasitesi × 0.7)) + 1`. Ölçülen maliyet sipariş başına ~0,65 ms API CPU'su (aşağıda); 8000/sn ≈ 5,2 çekirdek, %70 hedef kullanımla ~7,5 çekirdek: 2 vCPU'luk 4 pod, bir pod kaybına karşı +1. Worker'lar ise tepe yüke yetişmek zorunda değil: kampanya anında mesajlar kuyrukta birikir, worker'lar kendi hızlarında eritir. Worker'lar **ortalama yük ve kabul edilebilir gecikmeye** göre boyutlandırılır ve kuyruk derinliğine göre ölçeklenir. Lokalde her servisten 2 replica çalışır; amaç kapasite değil, eşzamanlılık tasarımının (SKIP LOCKED, lease, competing consumers) gerçekten çalıştığını göstermek.
 
 **Write amplification ve batching:** Mesaj başına işlemede arka plan, API'den daha fazla commit üretiyordu: e-posta başına claim + `Sent`, fatura başına ön kontrol + upsert, durum güncellemesi başına bir commit. Sipariş başına toplam ~8 commit; bunun yalnızca 1'i API'nin. Consumer'lar artık micro-batch çalışıyor ([§11](#consumer-pipeline)): batch başına tek claim, tek `Sent` işaretlemesi, tek fatura upsert'ü, tek durum güncellemesi. Relay zaten batch çalışıyordu (500'lük claim, toplu confirm, toplu delete).
 
@@ -457,6 +457,54 @@ Lokal ölçüm (5.000 sipariş, tek makine, her servisten bir kopya; `pg_stat_da
 Arka plandaki commit yükü sipariş başına ~7'den ~0,2'ye indi; geriye neredeyse yalnızca API'nin kaçınılmaz commit'i kalıyor. Süre karşılaştırmasında adil olan orta sütun: mesaj başına modda eşzamanlılığı artırmak süreyi kısaltıyor ama commit sayısını değiştirmiyor. Bu ölçüm gösterge niteliğinde; asıl karşılaştırma nginx, replica'lar ve k6 ile 6. aşamada.
 
 **Ack'ler** mesaj başına gönderiliyor, `multiple=true` ile toplu değil. Birden fazla batch aynı kanalda paralel çalıştığı için `multiple=true`, başka bir batch'in henüz işlenmemiş daha küçük delivery tag'li mesajlarını da onaylardı. Ack frame'i küçük ve client tarafında beklemeye yol açmıyor; batching'in kazancı DB commit'lerinde.
+
+### Yük testi (k6)
+
+Kurulum: nginx → 3 API kopyası, her worker'dan 2 kopya, hepsi container'da (`docker compose --profile app`); yük k6 ile, açık modelle (arrival rate: API yavaşlasa da k6 hızı düşürmez). Ortam tek bir laptop: Apple M4, 10 çekirdek; Docker'a 10 CPU ve 8 GB bellek. k6, nginx, API'ler, worker'lar, PostgreSQL, PgBouncer, RabbitMQ ve Mailpit **aynı CPU'yu paylaşıyor**; sayılar bu yüzden kapasitenin değil, darboğazların ve davranışın göstergesi. Komutlar README'de.
+
+**1. API tek başına** (worker'lar kapalı; sipariş + outbox yazımı), 30'ar saniyelik sabit hız:
+
+| Hedef | Kabul edilen | `503` | p95 | p99 | CPU (API / PostgreSQL / k6) |
+|---|---|---|---|---|---|
+| 3.000/sn | 2.985/sn | 0 | 48 ms | 124 ms | 2,3 / 1,0 / 0,6 çekirdek |
+| 4.000/sn | 3.981/sn | 0 | 75 ms | 160 ms | 2,6 / 1,9 / 1,1 |
+| 5.000/sn | 4.067/sn | 604/sn | 387 ms | 535 ms | 2,8 / 2,2 / 1,9 |
+| 6.000/sn | 4.517/sn | 1.159/sn | 345 ms | 499 ms | 2,5 / 2,0 / 1,5 |
+| 8.000/sn | 4.023/sn | 3.216/sn | 354 ms | 441 ms | 2,9 / 2,0 / 2,6 |
+
+Bu makinedeki tavan ~4.000–4.500 sipariş/sn ve sınırlayan şey makinenin toplam CPU'su: k6 8.000/sn üretmek için tek başına 2,6 çekirdek harcıyor. Kapasitenin iki katı yükte bile sistem kabul ettiği işi sürdürüyor, gecikme sınırlı kalıyor, tek bir hata logu yok; fazlası anında `503 + Retry-After` alıyor.
+
+**2. Birikimi eritme** (worker'lar kapalıyken biriken iş, sonra worker'lar açılıyor; `loadtest/drain.sh`):
+
+| | Mesaj başına | Batch |
+|---|---|---|
+| ~70.000 siparişlik birikim (280.000 mesaj) | 153 sn (458 sipariş/sn) | 118 sn (564 sipariş/sn) |
+| Commit / sipariş (üç DB toplam) | 7,05 | **0,17** |
+| PostgreSQL CPU | %114 → sipariş başına ~2,5 ms | **%15 → sipariş başına ~0,27 ms** |
+| Worker CPU (fatura + e-posta) | %185 | %125 |
+
+486.000 siparişlik büyük bir birikimde (batch): relay'ler outbox'ı ~50 sn'de yayınladı (~10.000 mesaj/sn); faturalar ~2.850/sn üretildi, tavan bilerek sağlayıcı limiti (2 kopya × 32 eşzamanlı çağrı × 20 ms = 3.200/sn); ~1 milyon e-posta ~1.900/sn gitti. Erime hızının iki modda yakın çıkmasının nedeni de bu: tavanı dış bağımlılıklar (simüle sağlayıcı, test SMTP sunucusu Mailpit) belirliyor. Batching dış bağımlılığı hızlandırmaz; **veritabanını darboğaz olmaktan çıkarır.**
+
+**3. Her şey birlikte** (`loadtest/full.sh 3000 60s`): makine ~1.400–1.500 sipariş/sn'de doyuyor (iki modda da), fazlası `503` alıyor. Yük sırasında kabul edilen bütün siparişlerin faturalanıp iki mailinin de gitmesi batch'te 252 sn, mesaj başına modda 381 sn sürdü.
+
+**8.000/sn'ye uzanım** (ölçülen sipariş başı maliyetlerle; tek makine ölçümü olduğu için kaba):
+
+| Bileşen | Sipariş başı | 8.000/sn için |
+|---|---|---|
+| API | ~0,65 ms CPU | ~5,2 çekirdek → 2 vCPU'luk 4+1 pod |
+| PostgreSQL, sipariş alma | ~0,5 ms CPU | ~4 çekirdek |
+| PostgreSQL, arka plan, batch | ~0,27 ms CPU | ~2 çekirdek |
+| PostgreSQL, arka plan, mesaj başına | ~2,5 ms CPU | ~20 çekirdek |
+| PgBouncer | 4.000/sn'de ~0,5 çekirdek | ~1 çekirdek: tek thread'in sınırı, birden fazla instance ya da PgCat |
+| Fatura sağlayıcısı | 20 ms | ~160 eşzamanlı çağrı (tepe için; worker'lar ortalamaya göre boyutlanır) |
+
+Batching'in asıl değeri bu tabloda: arka plan işinin DB maliyetini ~9 kat düşürüyor ve 8.000/sn'de API'nin ihtiyaç duyduğu DB kapasitesini ona bırakıyor.
+
+**Yük testinin ortaya çıkardıkları:**
+- **Load shedding sınırı yanlış ölçüye bağlıydı.** Kopya başına 512 eşzamanlı istek 20'lik DB havuzuyla yarışıyordu: fazla istekler ucuz bir şekilde kapıda beklemek yerine havuzda 2 sn bekleyip exception ile düşüyordu. Tam sistem testinde bu, 10.000'den fazla zaman aşımı ve kendini besleyen bir aşırı yük sarmalı demekti: makine doyunca gecikme artıyor, zaman aşımları exception ve log olarak daha da CPU yakıyordu. Sınır artık havuza göre (64 izin + 256 kuyruk). Sonuç: 6.000/sn'de kabul edilen 4.014 → 4.517/sn, p99 1,07 sn → 0,50 sn, sıfır hata logu. Bedeli: 5.000/sn'de kabul 4.746 → 4.067/sn; sabit bir sınırla hem en yüksek verimi hem sınırlı gecikmeyi tutturmak zor (bkz. [§16](#16-prod-notları), adaptif limit).
+- **Aynı hata üç kez stack trace'iyle loglanıyordu** (handler + EF'in iki kategorisi). EF'in `Database.Connection` ve `Update` kategorileri API'de kapatıldı; geçici hataları handler, diğerlerini ASP.NET'in exception middleware'i bir kez logluyor.
+- **Soğuk başlangıç + tam yük = sarmal.** Yeni açılmış kopyalara ilk saniyeden tam yük gelince (JIT, boş bağlantı havuzları) aynı sarmal başlıyor ve dakikalarca sürebiliyor. Testler bu yüzden rampalı ısınmayla başlıyor; prod'daki karşılığı [§16](#16-prod-notları)'da.
+- **nginx upstream adlarını yalnızca açılışta çözüyordu.** API kopyaları yeniden oluşturulunca trafik ölü adreslere, yani tek bir kopyaya gidiyordu. Artık `server … resolve` ile birkaç saniyede bir yeniden çözülüyor.
 
 ## 13. Thread-safety
 
@@ -510,8 +558,10 @@ Derleyici bunların bir kısmını zorunlu kılıyor ([`.editorconfig`](.editorc
 - **Secret'lar ve ortamlar:** Repodaki şifreler yalnızca lokal içindir. Prod'da secret store'dan ortam değişkeni olarak enjekte edilir; servis kullanıcıları en az yetkiyle (yalnızca kendi database'i) çalışır, iletişim TLS üzerinden olur.
 - **Ayrı PostgreSQL instance'ları:** Aynı instance'taki database'ler WAL, fsync, shared_buffers ve checkpoint'leri paylaşır. En azından `ordering` ayrı bir instance'ta olmalı; arka plan yazma yükü siparişin hot path'ini etkilememeli.
 - **Outbox tablosunun bakımı:** Yüksek hacimde silme dead tuple üretir. Tablo bazında autovacuum ayarı ya da zamana göre partitioning + partition drop.
-- **PgBouncer:** Tek thread'li. Birden fazla instance ya da çok thread'li bir alternatif (PgCat).
+- **PgBouncer:** Tek thread'li; ölçümde 4.000 sipariş/sn'de ~0,5 çekirdek, yani 8.000/sn'de tek çekirdeğin sınırı. Birden fazla instance (`so_reuseport`) ya da çok thread'li bir alternatif (PgCat).
 - **Ölçekleme:** API için CPU/RPS bazlı HPA; worker'lar için kuyruk derinliği bazlı KEDA (RabbitMQ scaler).
+- **Soğuk başlangıç:** Yeni pod'a ilk saniyeden tam yük verilmemeli (yük testinde bu, dakikalarca süren bir aşırı yük sarmalı başlattı). Readiness probe'un yanında ısınma (bağlantı havuzlarını açan ve sıcak yolları JIT'leyen bir başlangıç adımı) ve trafiğin yeni pod'a kademeli verilmesi (load balancer'da slow start). HPA da yük tepeye çıkmadan, erken ölçeklemeli.
+- **Adaptif eşzamanlılık limiti:** Load shedding sınırı şu an sabit (kopya başına 64 + 256 kuyruk). Sabit bir değer ya yüksek verim ya sınırlı gecikme için iyi; gecikmeye bakarak sınırı kendisi ayarlayan bir limiter (gradient / AIMD) ikisini birlikte tutar.
 - **RabbitMQ:** 3 node'luk cluster; quorum queue'lar Raft ile replike olur.
 - **E-posta sağlayıcısı:** Idempotency key destekleyen bir sağlayıcı; at-least-once penceresini kapatır.
 - **Bağımlılık güvenliği:** NuGet audit build'de açık. Transitive bir açık (örneğin MimeKit'in getirdiği `System.Security.Cryptography.Pkcs` 10.0.0'daki CVE-2026-84008) central package management ile yamalı sürüme sabitlendi; `dotnet list package --vulnerable --include-transitive` temiz. Prod'da CI'da aynı kontrol zorunlu olmalı.
@@ -527,4 +577,4 @@ Her aşamanın sonunda birlikte gözden geçirme yapılıyor.
 - [x] **3.** Notification.Worker: claim/lease, MailKit + Mailpit, retry/DLQ/circuit breaker
 - [x] **4.** Invoicing.Worker (upsert, kendi outbox'ı ve relay'i) + Ordering.Worker'daki fatura durumu consumer'ları
 - [x] **5.** Consumer micro-batching: batch başına tek claim/upsert/update, öğe bazında sonuçlandırma, `MaxBatchSize: 1` ile mesaj başına mod
-- [ ] **6.** nginx + replica'lar, k6 (mesaj başına ve batch karşılaştırması), README ve prod notları
+- [x] **6.** Container imajları, nginx + replica'lar, k6 yük testleri (API kapasitesi, mesaj başına ve batch karşılaştırması, tam sistem), bulunan sorunların düzeltilmesi, README ve prod notları

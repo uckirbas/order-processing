@@ -15,7 +15,7 @@ public static class OrderingPersistence
         services.AddDbContextPool<OrderingDbContext>(options => options.UseOrderingDatabase(connectionString));
 
     /// <summary>
-    /// Worker: one short-lived context per message from a pooled factory, on the process-wide
+    /// Worker: one short-lived context per batch from a pooled factory, on the process-wide
     /// <see cref="Npgsql.NpgsqlDataSource"/> the outbox relay also uses (a single connection pool).
     /// </summary>
     public static IServiceCollection AddOrderingDbContextFactory(this IServiceCollection services) =>
