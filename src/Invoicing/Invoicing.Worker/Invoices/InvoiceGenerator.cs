@@ -38,6 +38,12 @@ public sealed class InvoiceGeneratorOptions
     public TimeSpan AttemptTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     public TimeSpan TotalTimeout { get; set; } = TimeSpan.FromSeconds(20);
+
+    /// <summary>
+    /// Calls in flight to the provider per process. Batches generate their invoices concurrently, so without this
+    /// the provider would see up to Concurrency × MaxBatchSize simultaneous calls.
+    /// </summary>
+    public int MaxConcurrency { get; set; } = 32;
 }
 
 /// <summary>Stand-in for a real e-invoice provider, with configurable latency and failure injection.</summary>
@@ -88,10 +94,13 @@ internal static class InvoiceGeneration
             .Bind(configuration.GetSection(InvoiceGeneratorOptions.SectionName))
             .Validate(o => o.SupportedCurrencies.Length > 0, "InvoiceGenerator:SupportedCurrencies must not be empty.")
             .Validate(o => o.TransientFailureRate is >= 0 and <= 1, "InvoiceGenerator:TransientFailureRate must be between 0 and 1.")
+            .Validate(o => o.MaxConcurrency > 0, "InvoiceGenerator:MaxConcurrency must be positive.")
             .ValidateOnStart();
         services.AddSingleton<IInvoiceGenerator, SimulatedInvoiceGenerator>();
 
-        // Same shape as the SMTP pipeline: total timeout → retry (exponential + jitter) → breaker → attempt timeout.
+        // total timeout → retry (exponential + jitter) → breaker → concurrency limit → attempt timeout.
+        // The limit sits inside the retry, so a call waiting out its backoff holds no permit. Callers queue rather than
+        // being rejected (the consumer prefetch bounds the queue), and the wait counts against the total timeout only.
         services.AddResiliencePipeline(PipelineName, (pipeline, context) =>
         {
             var generator = context.GetOptions<InvoiceGeneratorOptions>();
@@ -114,6 +123,7 @@ internal static class InvoiceGeneration
                     BreakDuration = TimeSpan.FromSeconds(30),
                     ShouldHandle = transient,
                 })
+                .AddConcurrencyLimiter(generator.MaxConcurrency, queueLimit: int.MaxValue)
                 .AddTimeout(generator.AttemptTimeout);
         });
 

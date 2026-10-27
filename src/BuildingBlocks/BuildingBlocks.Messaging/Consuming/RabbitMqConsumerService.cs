@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Threading.Channels;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -9,7 +10,7 @@ using RabbitMQ.Client.Events;
 namespace BuildingBlocks.Messaging.Consuming;
 
 /// <summary>
-/// Consumes one queue with bounded concurrency and turns every handler outcome into exactly one settlement:
+/// Consumes one queue in batches and turns every item's outcome into exactly one settlement:
 /// <list type="bullet">
 /// <item>success → ack</item>
 /// <item>poison / unknown type / <see cref="PermanentMessageException"/> → DLQ</item>
@@ -17,8 +18,10 @@ namespace BuildingBlocks.Messaging.Consuming;
 /// <item>dependency circuit open → retry tier, budget untouched, and consumption pauses</item>
 /// <item>anything else → next retry tier (5 s → 30 s → 2 m → 10 m), then DLQ</item>
 /// </list>
-/// A retry or DLQ copy is confirmed by the broker before the original is acked, so a crash in between can only
-/// duplicate a message, never lose it.
+/// Each delivery waits inside its own event handler until its batch has run, then settles itself: the delivery
+/// body is only valid while that handler runs, and a failed item is retried or dead-lettered on its own, never with
+/// the rest of its batch. A retry or DLQ copy is confirmed by the broker before the original is acked, so a crash
+/// in between can only duplicate a message, never lose it.
 /// </summary>
 internal sealed partial class RabbitMqConsumerService<TMessage, THandler>(
     ConsumerRegistration<TMessage> registration,
@@ -28,7 +31,7 @@ internal sealed partial class RabbitMqConsumerService<TMessage, THandler>(
     IServiceScopeFactory scopes,
     TimeProvider clock,
     ILogger<RabbitMqConsumerService<TMessage, THandler>> logger) : BackgroundService
-    where THandler : class, IMessageHandler<TMessage>
+    where THandler : class, IBatchMessageHandler<TMessage>
 {
     private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(5);
 
@@ -41,6 +44,12 @@ internal sealed partial class RabbitMqConsumerService<TMessage, THandler>(
     // Cancelled only after the drain timeout on shutdown, so in-flight work normally completes.
     private readonly CancellationTokenSource _processing = new();
 
+    // Deliveries waiting for a batch. Unbounded on purpose: the prefetch already caps how many can exist.
+    private readonly Channel<BatchItem<TMessage>> _pending =
+        Channel.CreateUnbounded<BatchItem<TMessage>>(new UnboundedChannelOptions { SingleReader = true });
+
+    private readonly SemaphoreSlim _batchSlots = new(registration.Options.Concurrency, registration.Options.Concurrency);
+
     private IChannel? _channel;
     private string? _consumerTag;
     private int _inFlight;
@@ -50,10 +59,16 @@ internal sealed partial class RabbitMqConsumerService<TMessage, THandler>(
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _stopping = stoppingToken;
+
+        // Runs until the drain is over, so deliveries still parked at shutdown get their batch.
+        var dispatching = DispatchBatchesAsync(_processing.Token);
         try
         {
             await ConnectAsync(stoppingToken);
-            await Task.Delay(Timeout.InfiniteTimeSpan, clock, stoppingToken);
+
+            // Normally waits for shutdown; a dispatcher failure surfaces here and stops the host instead of
+            // leaving deliveries parked forever.
+            await dispatching.WaitAsync(stoppingToken);
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {
@@ -61,6 +76,7 @@ internal sealed partial class RabbitMqConsumerService<TMessage, THandler>(
         finally
         {
             await DrainAsync();
+            await dispatching;
         }
     }
 
@@ -68,6 +84,7 @@ internal sealed partial class RabbitMqConsumerService<TMessage, THandler>(
     {
         _processing.Dispose();
         _consumeGate.Dispose();
+        _batchSlots.Dispose();
         base.Dispose();
     }
 
@@ -80,15 +97,17 @@ internal sealed partial class RabbitMqConsumerService<TMessage, THandler>(
             {
                 await topology.EnsureDeclaredAsync(cancellationToken);
                 var connection = await connections.GetConsumeConnectionAsync(cancellationToken);
+
+                // Every prefetched delivery must be able to wait in its handler for its batch at the same time.
                 _channel = await connection.CreateChannelAsync(
                     new CreateChannelOptions(
                         publisherConfirmationsEnabled: false,
                         publisherConfirmationTrackingEnabled: false,
-                        consumerDispatchConcurrency: _options.Concurrency),
+                        consumerDispatchConcurrency: _options.Prefetch),
                     cancellationToken);
                 await _channel.BasicQosAsync(prefetchSize: 0, _options.Prefetch, global: false, cancellationToken);
                 await StartConsumingAsync(cancellationToken);
-                LogStarted(_queue, _options.Concurrency, _options.Prefetch);
+                LogStarted(_queue, _options.Concurrency, _options.MaxBatchSize, _options.Prefetch);
                 return;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -162,49 +181,155 @@ internal sealed partial class RabbitMqConsumerService<TMessage, THandler>(
             return true;
         }
 
+        var item = new BatchItem<TMessage>(message, context);
+        _pending.Writer.TryWrite(item);
+
+        Exception? error;
         try
         {
-            await using var scope = scopes.CreateAsyncScope();
-            await scope.ServiceProvider.GetRequiredService<THandler>().HandleAsync(message, context, cancellationToken);
-            return true;
+            error = await item.Outcome.WaitAsync(cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            // Shutdown before the item's batch finished: left unacked, the broker re-delivers it.
             return false;
         }
-        catch (DeferMessageException defer)
+
+        return error is null || await SettleFailureAsync(delivery, context, message, error, cancellationToken);
+    }
+
+    /// <returns>False only when shutdown interrupted the handler: the delivery is then left unacked.</returns>
+    private async Task<bool> SettleFailureAsync(
+        BasicDeliverEventArgs delivery, MessageContext context, TMessage message, Exception error,
+        CancellationToken cancellationToken)
+    {
+        if (error is OperationCanceledException && cancellationToken.IsCancellationRequested)
+        {
+            return false;
+        }
+
+        if (error is DeferMessageException defer)
         {
             await RetryAsync(delivery, context, TierFor(defer.Delay), context.RetryCount, defer, cancellationToken);
             LogDeferred(_queue, context.MessageId, defer.Message);
             return true;
         }
-        catch (Exception ex) when (FindOpenCircuit(ex) is { } openCircuit)
+
+        if (FindOpenCircuit(error) is { } openCircuit)
         {
-            await RetryAsync(delivery, context, tier: 0, context.RetryCount, ex, cancellationToken);
+            await RetryAsync(delivery, context, tier: 0, context.RetryCount, error, cancellationToken);
             TriggerPause(openCircuit.RetryAfter);
             return true;
         }
-        catch (PermanentMessageException ex)
+
+        if (error is PermanentMessageException)
         {
-            await DeadLetterAsync(delivery, context, "Permanent", ex, cancellationToken);
+            await DeadLetterAsync(delivery, context, "Permanent", error, cancellationToken);
             return true;
+        }
+
+        if (context.RetryCount < RabbitMqTopology.RetryDelays.Count)
+        {
+            await RetryAsync(delivery, context, tier: context.RetryCount, context.RetryCount + 1, error, cancellationToken);
+            return true;
+        }
+
+        await using (var scope = scopes.CreateAsyncScope())
+        {
+            await scope.ServiceProvider.GetRequiredService<THandler>()
+                .OnRetriesExhaustedAsync(message, context, error, cancellationToken);
+        }
+
+        await DeadLetterAsync(delivery, context, "RetryExhausted", error, cancellationToken);
+        return true;
+    }
+
+    /// <summary>
+    /// Groups parked deliveries into batches and runs up to <see cref="ConsumerOptions.Concurrency"/> of them at once.
+    /// A batch is only formed once a slot is free, so while every slot is busy deliveries accumulate and the next
+    /// batch is larger: batch size follows the load by itself.
+    /// </summary>
+    private async Task DispatchBatchesAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (true)
+            {
+                await _batchSlots.WaitAsync(cancellationToken);
+                List<BatchItem<TMessage>> batch;
+                try
+                {
+                    batch = await CollectBatchAsync(cancellationToken);
+                }
+                catch
+                {
+                    _batchSlots.Release();
+                    throw;
+                }
+
+                // Off the dispatcher: the handler's synchronous part (e.g. rendering templates) must not hold it up.
+                _ = Task.Run(() => RunBatchAsync(batch, cancellationToken), CancellationToken.None);
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+    }
+
+    private async Task<List<BatchItem<TMessage>>> CollectBatchAsync(CancellationToken cancellationToken)
+    {
+        var reader = _pending.Reader;
+        var batch = new List<BatchItem<TMessage>>(_options.MaxBatchSize) { await reader.ReadAsync(cancellationToken) };
+        Fill(reader, batch);
+
+        if (batch.Count < _options.MaxBatchSize && _options.MaxBatchDelay > TimeSpan.Zero)
+        {
+            using var window = new CancellationTokenSource(_options.MaxBatchDelay, clock);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, window.Token);
+            try
+            {
+                while (batch.Count < _options.MaxBatchSize && await reader.WaitToReadAsync(linked.Token))
+                {
+                    Fill(reader, batch);
+                }
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                // The window closed: go with what has arrived.
+            }
+        }
+
+        return batch;
+    }
+
+    private void Fill(ChannelReader<BatchItem<TMessage>> reader, List<BatchItem<TMessage>> batch)
+    {
+        while (batch.Count < _options.MaxBatchSize && reader.TryRead(out var item))
+        {
+            batch.Add(item);
+        }
+    }
+
+    private async Task RunBatchAsync(List<BatchItem<TMessage>> batch, CancellationToken cancellationToken)
+    {
+        Exception? batchError = null;
+        try
+        {
+            await using var scope = scopes.CreateAsyncScope();
+            await scope.ServiceProvider.GetRequiredService<THandler>().HandleAsync(batch, cancellationToken);
+            LogBatchHandled(_queue, batch.Count);
         }
         catch (Exception ex)
         {
-            if (context.RetryCount < RabbitMqTopology.RetryDelays.Count)
+            batchError = ex;
+        }
+        finally
+        {
+            _batchSlots.Release();
+            foreach (var item in batch)
             {
-                await RetryAsync(delivery, context, tier: context.RetryCount, context.RetryCount + 1, ex, cancellationToken);
-                return true;
+                item.Complete(batchError);
             }
-
-            await using (var scope = scopes.CreateAsyncScope())
-            {
-                await scope.ServiceProvider.GetRequiredService<THandler>()
-                    .OnRetriesExhaustedAsync(message, context, ex, cancellationToken);
-            }
-
-            await DeadLetterAsync(delivery, context, "RetryExhausted", ex, cancellationToken);
-            return true;
         }
     }
 
@@ -387,8 +512,11 @@ internal sealed partial class RabbitMqConsumerService<TMessage, THandler>(
         }
     }
 
-    [LoggerMessage(Level = LogLevel.Information, Message = "Consuming {Queue} (concurrency {Concurrency}, prefetch {Prefetch})")]
-    private partial void LogStarted(string queue, int concurrency, int prefetch);
+    [LoggerMessage(Level = LogLevel.Information, Message = "Consuming {Queue} ({Concurrency} batches of up to {MaxBatchSize} in parallel, prefetch {Prefetch})")]
+    private partial void LogStarted(string queue, int concurrency, int maxBatchSize, int prefetch);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "{Queue}: batch of {Count} handled")]
+    private partial void LogBatchHandled(string queue, int count);
 
     [LoggerMessage(Level = LogLevel.Information, Message = "Stopped consuming {Queue}")]
     private partial void LogStopped(string queue);

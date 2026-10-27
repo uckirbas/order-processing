@@ -2,7 +2,8 @@
   "version": "0.2.0",
   // Start "All services" from the Run and Debug view. The single-service entries are hidden and only used by the
   // compounds, which build the solution once up front (four parallel builds of shared projects would collide).
-  // Consumers run with concurrency 1 / prefetch 1 here, so a breakpoint stops one message at a time.
+  // Consumers run with concurrency 1 / prefetch 1 / batches of 1 here, so a breakpoint stops one message at a time.
+  // To watch batching instead, raise Prefetch and MaxBatchSize together (e.g. 10 and 10, MaxBatchDelay "00:00:02").
   "configurations": [
     {
       "name": "Ordering.Api",
@@ -26,8 +27,10 @@
         "DOTNET_ENVIRONMENT": "Development",
         "Consumers__InvoiceGenerated__Concurrency": "1",
         "Consumers__InvoiceGenerated__Prefetch": "1",
+        "Consumers__InvoiceGenerated__MaxBatchSize": "1",
         "Consumers__InvoiceFailed__Concurrency": "1",
-        "Consumers__InvoiceFailed__Prefetch": "1"
+        "Consumers__InvoiceFailed__Prefetch": "1",
+        "Consumers__InvoiceFailed__MaxBatchSize": "1"
       },
       "presentation": { "hidden": true }
     },
@@ -40,7 +43,8 @@
       "env": {
         "DOTNET_ENVIRONMENT": "Development",
         "Consumers__OrderPlaced__Concurrency": "1",
-        "Consumers__OrderPlaced__Prefetch": "1"
+        "Consumers__OrderPlaced__Prefetch": "1",
+        "Consumers__OrderPlaced__MaxBatchSize": "1"
       },
       "presentation": { "hidden": true }
     },
@@ -54,8 +58,10 @@
         "DOTNET_ENVIRONMENT": "Development",
         "Consumers__OrderPlaced__Concurrency": "1",
         "Consumers__OrderPlaced__Prefetch": "1",
+        "Consumers__OrderPlaced__MaxBatchSize": "1",
         "Consumers__InvoiceGenerated__Concurrency": "1",
-        "Consumers__InvoiceGenerated__Prefetch": "1"
+        "Consumers__InvoiceGenerated__Prefetch": "1",
+        "Consumers__InvoiceGenerated__MaxBatchSize": "1"
       },
       "presentation": { "hidden": true }
     }

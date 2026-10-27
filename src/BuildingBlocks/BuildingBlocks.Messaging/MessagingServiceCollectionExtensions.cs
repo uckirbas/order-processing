@@ -60,7 +60,7 @@ public static class MessagingServiceCollectionExtensions
     }
 
     /// <summary>
-    /// Consumes <paramref name="queue"/> with <typeparamref name="THandler"/> (resolved from a new scope per delivery).
+    /// Consumes <paramref name="queue"/> with <typeparamref name="THandler"/> (resolved from a new scope per batch).
     /// Only messages whose AMQP type equals <c>TMessage.EventType</c> are accepted; anything else is dead-lettered.
     /// </summary>
     public static IServiceCollection AddRabbitMqConsumer<TMessage, THandler>(
@@ -69,10 +69,17 @@ public static class MessagingServiceCollectionExtensions
         JsonTypeInfo<TMessage> typeInfo,
         Action<ConsumerOptions>? configure = null)
         where TMessage : IIntegrationEvent
-        where THandler : class, IMessageHandler<TMessage>
+        where THandler : class, IBatchMessageHandler<TMessage>
     {
         var options = new ConsumerOptions();
         configure?.Invoke(options);
+
+        if (options.Concurrency < 1 || options.MaxBatchSize < 1 || options.Prefetch < options.MaxBatchSize)
+        {
+            throw new InvalidOperationException(
+                $"Consumer of '{queue.Name}': Concurrency and MaxBatchSize must be at least 1, and Prefetch at least MaxBatchSize " +
+                $"(got {options.Concurrency}, {options.MaxBatchSize}, {options.Prefetch}).");
+        }
 
         services.TryAddSingleton<FailedMessagePublisher>();
         services.TryAddScoped<THandler>();

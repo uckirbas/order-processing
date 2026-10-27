@@ -2,50 +2,66 @@ using Microsoft.EntityFrameworkCore;
 
 namespace Notification.Worker.Persistence;
 
+internal sealed record ClaimRequest(Guid OrderId, string Recipient);
+
+internal sealed record ClaimedNotification(Guid OrderId);
+
 /// <summary>
 /// The claim/lease state machine of <see cref="Notification"/>. Every transition is one short, auto-committed
-/// conditional statement (compare-and-set); nothing holds a row lock while an e-mail is being sent.
-/// All timestamps that leases are compared against come from the database clock, so pod clock skew does not matter.
+/// conditional statement (compare-and-set) covering a whole batch; nothing holds a row lock while e-mails are being
+/// sent. All timestamps that leases are compared against come from the database clock, so pod clock skew does not
+/// matter.
 /// </summary>
 internal sealed class NotificationStore(NotificationDbContext db, TimeProvider clock)
 {
     /// <summary>
-    /// Takes ownership of (order, type): inserts the row, or takes over a Failed row or a Sending row whose lease
-    /// expired. Concurrent claims for the same key are serialised by the unique index; exactly one wins.
+    /// Takes ownership of (order, <paramref name="type"/>) for each request: inserts the row, or takes over a Failed
+    /// row or a Sending row whose lease expired. Concurrent claims for the same key are serialised by the unique
+    /// index; exactly one wins. The requests must not repeat an order: one statement cannot upsert a row twice.
     /// </summary>
-    /// <returns>True when this caller now owns the notification and must send it.</returns>
-    public async Task<bool> TryClaimAsync(
-        Guid orderId, NotificationType type, string recipient, Guid leaseId, TimeSpan lease, CancellationToken cancellationToken)
+    /// <returns>The orders this caller now owns and must send.</returns>
+    public async Task<HashSet<Guid>> TryClaimAsync(
+        NotificationType type, IReadOnlyList<ClaimRequest> requests, Guid leaseId, TimeSpan lease,
+        CancellationToken cancellationToken)
     {
         var typeName = type.ToString();
+        var ids = requests.Select(_ => Guid.CreateVersion7()).ToArray();
+        var orderIds = requests.Select(r => r.OrderId).ToArray();
+        var recipients = requests.Select(r => r.Recipient).ToArray();
 
         // Parameterised: every interpolation becomes a DbParameter (EF1002 would reject the *Raw* variant).
-        var affected = await db.Database.ExecuteSqlAsync(
+        // Rows are written in order_id order, so concurrent batches take the unique-index locks in the same order.
+        var claimed = await db.Database.SqlQuery<ClaimedNotification>(
             $"""
             INSERT INTO notifications (id, order_id, type, recipient, status, lease_id, locked_until, attempts, created_at, updated_at)
-            VALUES ({Guid.CreateVersion7()}, {orderId}, {typeName}, {recipient}, 'Sending', {leaseId}, now() + {lease}, 1, now(), now())
+            SELECT r.id, r.order_id, {typeName}, r.recipient, 'Sending', {leaseId}, now() + {lease}, 1, now(), now()
+            FROM   unnest({ids}, {orderIds}, {recipients}) AS r(id, order_id, recipient)
+            ORDER  BY r.order_id
             ON CONFLICT (order_id, type) DO UPDATE
             SET    status = 'Sending', lease_id = EXCLUDED.lease_id, locked_until = EXCLUDED.locked_until,
                    recipient = EXCLUDED.recipient, attempts = notifications.attempts + 1, updated_at = now()
             WHERE  notifications.status = 'Failed'
                OR (notifications.status = 'Sending' AND notifications.locked_until < now())
-            """,
-            cancellationToken);
+            RETURNING order_id
+            """).ToListAsync(cancellationToken);
 
-        return affected == 1;
+        return [.. claimed.Select(c => c.OrderId)];
     }
 
-    public Task<NotificationStatus?> GetStatusAsync(Guid orderId, NotificationType type, CancellationToken cancellationToken) =>
+    public Task<Dictionary<Guid, NotificationStatus>> GetStatusesAsync(
+        NotificationType type, Guid[] orderIds, CancellationToken cancellationToken) =>
         db.Notifications.AsNoTracking()
-            .Where(n => n.OrderId == orderId && n.Type == type)
-            .Select(n => (NotificationStatus?)n.Status)
-            .SingleOrDefaultAsync(cancellationToken);
+            .Where(n => n.Type == type && orderIds.Contains(n.OrderId))
+            .ToDictionaryAsync(n => n.OrderId, n => n.Status, cancellationToken);
 
-    /// <returns>0 when the lease was lost meanwhile (another worker took over): the outcome is not ours to record.</returns>
-    public Task<int> MarkSentAsync(Guid orderId, NotificationType type, Guid leaseId, CancellationToken cancellationToken)
+    /// <returns>
+    /// How many were recorded. Fewer than <paramref name="orderIds"/> means some leases were lost meanwhile (another
+    /// worker took over): those outcomes are not ours to record.
+    /// </returns>
+    public Task<int> MarkSentAsync(NotificationType type, Guid[] orderIds, Guid leaseId, CancellationToken cancellationToken)
     {
         var now = clock.GetUtcNow();
-        return Owned(orderId, type, leaseId).ExecuteUpdateAsync(
+        return Owned(type, orderIds, leaseId).ExecuteUpdateAsync(
             set => set
                 .SetProperty(n => n.Status, NotificationStatus.Sent)
                 .SetProperty(n => n.SentAt, now)
@@ -56,19 +72,19 @@ internal sealed class NotificationStore(NotificationDbContext db, TimeProvider c
     }
 
     /// <summary>Transient failure: releases the claim so the retry (or another worker) can take it.</summary>
-    public Task<int> MarkFailedAsync(Guid orderId, NotificationType type, Guid leaseId, string error, CancellationToken cancellationToken) =>
-        Finish(orderId, type, leaseId, NotificationStatus.Failed, error, cancellationToken);
+    public Task<int> MarkFailedAsync(NotificationType type, Guid orderId, Guid leaseId, string error, CancellationToken cancellationToken) =>
+        Finish(type, orderId, leaseId, NotificationStatus.Failed, error, cancellationToken);
 
     /// <summary>Permanent failure (e.g. SMTP 550): never retried.</summary>
-    public Task<int> MarkDeadAsync(Guid orderId, NotificationType type, Guid leaseId, string error, CancellationToken cancellationToken) =>
-        Finish(orderId, type, leaseId, NotificationStatus.Dead, error, cancellationToken);
+    public Task<int> MarkDeadAsync(NotificationType type, Guid orderId, Guid leaseId, string error, CancellationToken cancellationToken) =>
+        Finish(type, orderId, leaseId, NotificationStatus.Dead, error, cancellationToken);
 
     private Task<int> Finish(
-        Guid orderId, NotificationType type, Guid leaseId, NotificationStatus status, string error, CancellationToken cancellationToken)
+        NotificationType type, Guid orderId, Guid leaseId, NotificationStatus status, string error, CancellationToken cancellationToken)
     {
         var now = clock.GetUtcNow();
         var lastError = error.Length <= 1000 ? error : error[..1000];
-        return Owned(orderId, type, leaseId).ExecuteUpdateAsync(
+        return Owned(type, [orderId], leaseId).ExecuteUpdateAsync(
             set => set
                 .SetProperty(n => n.Status, status)
                 .SetProperty(n => n.LastError, lastError)
@@ -78,7 +94,7 @@ internal sealed class NotificationStore(NotificationDbContext db, TimeProvider c
     }
 
     /// <summary>The fencing condition: only the current lease holder, while the row is still Sending.</summary>
-    private IQueryable<Notification> Owned(Guid orderId, NotificationType type, Guid leaseId) =>
+    private IQueryable<Notification> Owned(NotificationType type, Guid[] orderIds, Guid leaseId) =>
         db.Notifications.Where(n =>
-            n.OrderId == orderId && n.Type == type && n.LeaseId == leaseId && n.Status == NotificationStatus.Sending);
+            n.Type == type && orderIds.Contains(n.OrderId) && n.LeaseId == leaseId && n.Status == NotificationStatus.Sending);
 }

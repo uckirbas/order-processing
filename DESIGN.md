@@ -275,7 +275,7 @@ Notlar:
 
 ## 9. E-posta: claim + lease state machine
 
-SMTP bir DB transaction'ına dahil edilemez ve gönderilmiş bir mail geri alınamaz. Bu yüzden önce sahiplenme (claim), sonra transaction dışında gönderim, sonra işaretleme yapılıyor.
+SMTP bir DB transaction'ına dahil edilemez ve gönderilmiş bir mail geri alınamaz. Bu yüzden önce sahiplenme (claim), sonra transaction dışında gönderim, sonra işaretleme yapılıyor. Her adım bir batch'in tamamını tek SQL ifadesiyle kapsar (bkz. [§12](#12-performans-ve-kapasite)).
 
 ```mermaid
 stateDiagram-v2
@@ -291,49 +291,56 @@ stateDiagram-v2
 
 ```sql
 INSERT INTO notifications (id, order_id, type, recipient, status, lease_id, locked_until, attempts, ...)
-VALUES (@id, @order_id, @type, @recipient, 'Sending', @lease_id, now() + @lease_duration, 1, ...)
+SELECT r.id, r.order_id, @type, r.recipient, 'Sending', @lease_id, now() + @lease_duration, 1, ...
+FROM   unnest(@ids, @order_ids, @recipients) AS r(id, order_id, recipient)
+ORDER  BY r.order_id
 ON CONFLICT (order_id, type) DO UPDATE
 SET    status = 'Sending', lease_id = EXCLUDED.lease_id,
        locked_until = EXCLUDED.locked_until, attempts = notifications.attempts + 1, updated_at = now()
 WHERE  notifications.status = 'Failed'
-   OR (notifications.status = 'Sending' AND notifications.locked_until < now());
+   OR (notifications.status = 'Sending' AND notifications.locked_until < now())
+RETURNING order_id;
 ```
 
 | Adım | Ayrıntı |
 |---|---|
-| 1. Claim (kısa tx) | Etkilenen satır 1 → iş bende. 0 → mevcut duruma bakılır: `Sent`/`Dead` → ack; diğer her durum → delay kuyruğu (**ack edilmez**; diğer worker gönderemeden ölmüş olabilir) |
-| 2. Gönderim (tx dışında) | SMTP timeout 10 sn, Polly retry + circuit breaker. `Message-ID` deterministik: `<order-{id}-{type}@…>` |
-| 3. İşaretleme (kısa tx) | `UPDATE … SET status='Sent' WHERE … AND lease_id = @lease_id`. Lease'i kaybetmiş eski sahip, başkasının kaydının üzerine yazamaz (fencing). Bu update'in **kendi** kısa retry'ı var; SMTP bu yüzden asla tekrar çağrılmaz. Retry'lar da başarısız olursa mesaj yine ack edilir ve hata loglanır: mail zaten gitti, ack etmemek kesin bir mükerrer mail demek |
+| 1. Claim (kısa tx) | Batch'in tamamı tek ifadeyle. Dönen `order_id`'ler → iş bende. Dönmeyenlerin mevcut durumuna tek sorguyla bakılır: `Sent`/`Dead` → ack; diğer her durum → delay kuyruğu (**ack edilmez**; diğer worker gönderemeden ölmüş olabilir) |
+| 2. Gönderim (tx dışında) | Batch'in mailleri paralel gönderilir; gerçek eşzamanlılığı SMTP bağlantı havuzu (process başına 16) sınırlar. SMTP timeout 10 sn, Polly retry + circuit breaker. `Message-ID` deterministik: `<order-{id}-{type}@…>` |
+| 3. İşaretleme (kısa tx) | Gönderilenlerin tamamı tek `UPDATE … SET status='Sent' WHERE order_id = ANY(@sent) AND lease_id = @lease_id`. Lease'i kaybetmiş eski sahip, başkasının kaydının üzerine yazamaz (fencing). Bu update'in **kendi** kısa retry'ı var; SMTP bu yüzden asla tekrar çağrılmaz. Retry'lar da başarısız olursa mesajlar yine ack edilir ve hata loglanır: mailler zaten gitti, ack etmemek kesin bir mükerrer mail demek. Başarısız gönderimler mail başına `Failed`/`Dead` olarak işaretlenir ve tek tek retry/DLQ yoluna gider |
 
-- **Lease:** 60 sn. SMTP timeout'u ve in-process retry'ları kapsar. Tüm zaman karşılaştırmaları DB'nin `now()`'ı ile yapılır; pod saatleri arasındaki fark (clock skew) sorun olmaz.
+- **Lease:** 60 sn, batch başına tek lease id. Batch'teki gönderimler paralel ve her biri (havuz beklemesi dahil) SMTP pipeline'ının 30 sn'lik toplam timeout'u ile sınırlı; bu yüzden lease batch'in tamamını kapsar. Tüm zaman karşılaştırmaları DB'nin `now()`'ı ile yapılır; pod saatleri arasındaki fark (clock skew) sorun olmaz.
 - **`Dead` yalnızca kalıcı hatalar için.** Retry'ı tükenen mail `Failed` olarak kalır ve DLQ'ya gider. Böylece DLQ'dan replay edilen mesaj claim'i tekrar alabilir. Retry'ın tükenip tükenmediğine mesajdaki `x-retry-count` karar verir; DB'deki `attempts` yalnızca bilgi amaçlı.
-- **Sınır:** SMTP "250 OK" ile `Sent` işaretlemesi arasındaki milisaniyelik pencerede crash olursa mail iki kez gidebilir (at-least-once). Harici bir sistemle exactly-once mümkün değil. Redis gibi ikinci bir kayıt deposu bu pencereyi kapatmaz, sadece yerini değiştirir. Prod'da idempotency key destekleyen bir e-posta sağlayıcısıyla pencere tamamen kapanır.
+- **Aynı batch'te aynı siparişin ikinci kopyası** (mükerrer teslim) claim'e girmez, ack edilir; işi ilk kopya taşır, başarısız olursa kendi başına retry/DLQ yoluna gider. Tek bir `INSERT … ON CONFLICT DO UPDATE` aynı satırı iki kez güncelleyemediği için bu ayıklama zorunlu.
+- **Sınır:** SMTP "250 OK" ile `Sent` işaretlemesi arasındaki pencerede crash olursa mail iki kez gidebilir (at-least-once). Batching ile bu pencere, batch'in ilk gönderiminden son gönderiminden sonraki işaretlemeye kadar uzar (Mailpit'te birkaç on ms) ve bir crash o batch'te gönderilmiş mailleri tekrarlatır. Bu, mail başına iki commit yerine batch başına iki commit için bilinçli bir takas; deterministik `Message-ID` mail istemcilerinin tekrarı birleştirmesini sağlar. Harici bir sistemle exactly-once mümkün değil. Redis gibi ikinci bir kayıt deposu bu pencereyi kapatmaz, sadece yerini değiştirir. Prod'da idempotency key destekleyen bir e-posta sağlayıcısıyla pencere tamamen kapanır.
 
 ## 10. Fatura ve sipariş durumu
 
 Faturada etki DB içinde kaldığı için mükerrer kontrolü ve iş **aynı transaction'da** atomik olarak yapılabiliyor; claim veya lease gerekmiyor.
 
-1. Ucuz ön kontrol: `invoices` tablosunda `Generated` kayıt varsa ack edilir. Bu sadece optimizasyon; garanti constraint'ten gelir.
-2. Fatura içeriği üretilir (CPU işi, transaction dışında).
-3. Tek kısa tx: koşullu upsert + outbox'a `InvoiceGenerated`.
+1. Ucuz ön kontrol, batch için tek sorgu: `invoices` tablosunda `Generated` kaydı olan siparişler ack edilir. Aynı batch'te aynı siparişin ikinci kopyası da ack edilir; işi ilk kopya taşır. Bu sadece optimizasyon; garanti constraint'ten gelir.
+2. Faturalar transaction dışında, **paralel** üretilir. Batching olmadan sağlayıcıya giden eşzamanlı çağrı sayısını consumer concurrency sınırlıyordu; artık Concurrency × MaxBatchSize'a kadar çıkabileceği için Polly pipeline'ında process başına bir concurrency limiter var (varsayılan 32). Limiter retry'ın içinde: backoff bekleyen çağrı izin tutmaz.
+3. Batch başına tek kısa tx: tek koşullu upsert ifadesi + outbox'a her fatura için `InvoiceGenerated`.
 
 ```sql
 INSERT INTO invoices (id, order_id, ..., status, invoice_number, ...)
-VALUES (@id, @order_id, ..., 'Generated', nextval('invoice_number_seq'), ...)
+SELECT d.id, d.order_id, ..., 'Generated', nextval('invoice_number_seq'), ...
+FROM   unnest(@ids, @order_ids, ..., @lines::jsonb[]) AS d(id, order_id, ..., lines)
+ORDER  BY d.order_id                      -- eşzamanlı batch'ler index kilitlerini aynı sırayla alır
 ON CONFLICT (order_id) DO UPDATE
 SET    status = 'Generated', invoice_number = EXCLUDED.invoice_number,
        failure_reason = NULL, updated_at = now()
 WHERE  invoices.status = 'Failed'          -- yalnızca Failed kayıt onarılabilir
-RETURNING id, invoice_number, issued_at;
+RETURNING id, order_id, invoice_number, issued_at;
 ```
 
-`SqlQuery<IssuedInvoice>` bu sonucu bir record'a eşler. Snake_case naming convention EF'nin ad-hoc tiplerine de uygulandığı için kolonlar alias'sız, `invoice_number` gibi adlarıyla dönmeli; `AS "InvoiceNumber"` yazılsaydı eşleme bozulurdu. Sorgu ayrıca compose edilmemeli: `FirstOrDefault` eklenirse EF `INSERT … RETURNING`'i bir sub-select'e sarar ve PostgreSQL bunu reddeder. Bu yüzden `ToListAsync` kullanılıyor.
+`SqlQuery<IssuedInvoice>` bu sonucu bir record'a eşler. Snake_case naming convention EF'nin ad-hoc tiplerine de uygulandığı için kolonlar alias'sız, `invoice_number` gibi adlarıyla dönmeli; `AS "InvoiceNumber"` yazılsaydı eşleme bozulurdu. Sorgu ayrıca compose edilmemeli: `FirstOrDefault` eklenirse EF `INSERT … RETURNING`'i bir sub-select'e sarar ve PostgreSQL bunu reddeder. Bu yüzden `ToListAsync` kullanılıyor. Diziler (`Guid[]`, `string[]`, `decimal[]`) Npgsql'de tek bir array parametresi olarak gider.
 
-- Satır dönerse fatura ilk kez üretilmiş ya da `Failed` kayıt onarılmıştır; outbox'a `InvoiceGenerated` yazılır. Satır dönmezse mükerrer mesajdır; event yazılmaz.
+- Satır dönen sipariş için fatura ilk kez üretilmiş ya da `Failed` kayıt onarılmıştır; outbox'a `InvoiceGenerated` yazılır. Satır dönmeyen sipariş mükerrer mesajdır; event yazılmaz.
+- Sağlayıcının reddettiği (kalıcı) ya da sürekli hata verdiği sipariş batch'ten ayrılır ve kendi başına sonuçlanır; batch'in geri kalanı faturalanır.
 - Kalıcı hatada: `INSERT … 'Failed' … ON CONFLICT (order_id) DO NOTHING`. Etkilenen satır 1 ise `InvoiceFailed` yazılır ve mesaj DLQ'ya gider. `Generated` bir kayıt asla `Failed`'a düşürülmez.
 - Fatura numarası `INV-` + sequence. `nextval` conflict kontrolünden önce çalıştığı ve rollback'te geri alınmadığı için numaralarda boşluk olabilir; ön kontrol bunu azaltır. Boşluksuz numaralandırma case kapsamında değil.
 
-**`order_status` geçişleri** (ordering-worker, koşullu `ExecuteUpdateAsync`):
+**`order_status` geçişleri** (ordering-worker, batch başına tek koşullu `ExecuteUpdateAsync`, `order_id = ANY(...)`):
 
 | Gelen event | İzin verilen mevcut durum | Yeni durum |
 |---|---|---|
@@ -348,7 +355,7 @@ Event'ler hangi sırayla gelirse gelsin sonuç aynı: replay sonrası `InvoiceFa
 **Raw SQL yüzeyi bilinçli olarak dar tutuldu:** Yalnızca EF Core'un ifade edemediği yerler raw SQL ve her biri kendi sınıfında toplu duruyor:
 - Outbox claim, delete ve release: `OutboxStore`, doğrudan Npgsql, `$1` parametreleri
 - Fatura upsert ve hata kaydı: `InvoiceRepository`, EF `ExecuteSqlAsync` / `SqlQuery`
-- Mail claim: `NotificationRepository`, EF `ExecuteSqlAsync`
+- Mail claim: `NotificationStore`, EF `SqlQuery`
 
 Tamamı parametreli (EF tarafında EF1002 build hatası) ve transaction kapsamlı. Advisory lock, `LISTEN` ya da `SET` gibi session-level özellik yok; PgBouncer transaction mode ile uyumlu. Geri kalan her şey tipli EF (`SaveChangesAsync`, `ExecuteUpdateAsync`, `ExecuteDeleteAsync`).
 
@@ -386,16 +393,20 @@ Polly pipeline sırası, dıştan içe: toplam timeout → retry → circuit bre
 
 ### Consumer pipeline
 
-Ortak consumer altyapısı ([`RabbitMqConsumerService`](src/BuildingBlocks/BuildingBlocks.Messaging/Consuming/RabbitMqConsumerService.cs)) her teslimatı tam olarak bir sonuca bağlar. Retry ya da DLQ kopyası broker'dan confirm alınmadan orijinal mesaj ack edilmez; bu yüzden arada bir crash olursa mesaj en fazla tekrar eder, kaybolmaz.
+Ortak consumer altyapısı ([`RabbitMqConsumerService`](src/BuildingBlocks/BuildingBlocks.Messaging/Consuming/RabbitMqConsumerService.cs)) mesajları batch'ler halinde handler'a verir ama her teslimatı **tek tek** tam olarak bir sonuca bağlar. Retry ya da DLQ kopyası broker'dan confirm alınmadan orijinal mesaj ack edilmez; bu yüzden arada bir crash olursa mesaj en fazla tekrar eder, kaybolmaz.
 
-| Handler'ın sonucu | Consumer'ın yaptığı |
+**Batch'in oluşumu:** Her teslimat kendi event handler'ı içinde, batch'i işlenene kadar bekler (RabbitMQ client'ında delivery body yalnızca handler çalışırken geçerli; retry/DLQ kopyası o body'den yayınlanıyor). Bu yüzden kanalın `ConsumerDispatchConcurrency` değeri prefetch'e eşit: prefetch edilen her teslimat aynı anda bekleyebilmeli. Tek bir dağıtıcı döngü bekleyenleri toplar ve en fazla `Concurrency` batch'i paralel çalıştırır. Batch ancak boş bir slot olduğunda oluşturulur: bütün slotlar meşgulken teslimatlar birikir ve sonraki batch büyür. Yani batch boyutu yüke göre kendiliğinden ayarlanır, yük düşükken tek mesaj beklemez. `MaxBatchDelay` (10 ms), dolmamış bir batch'in daha fazla mesaj için bekleyebileceği üst süre. `MaxBatchSize: 1` mesaj başına moda döner; iki mod aynı kodla ölçülebilsin diye bu seçenek bilerek bırakıldı.
+
+| Öğenin sonucu | Consumer'ın yaptığı |
 |---|---|
-| Normal dönüş | ack |
-| Bozuk JSON, bilinmeyen tip/versiyon, `PermanentMessageException` | DLQ (`Permanent`) |
+| Handler normal döndü, öğe işaretlenmedi | ack |
+| Bozuk JSON, bilinmeyen tip/versiyon (batch'e girmeden), `PermanentMessageException` | DLQ (`Permanent`) |
 | `DeferMessageException` (iş başka bir worker'da) | Gecikmeli retry seviyesi; **retry bütçesi tüketilmez** |
 | Bağımlılığın circuit'i açık (`BrokenCircuitException`) | 5 sn seviyesi, bütçe tüketilmez, ve consumer breaker'ın `RetryAfter` süresi kadar **duraklatılır** |
-| Diğer her şey | Sonraki retry seviyesi; seviyeler bitince `OnRetriesExhaustedAsync` çağrılır, ardından DLQ (`RetryExhausted`) |
+| Diğer her şey | Sonraki retry seviyesi; seviyeler bitince `OnRetriesExhaustedAsync` (mesaj başına) çağrılır, ardından DLQ (`RetryExhausted`) |
 | Retry/DLQ kopyası yayınlanamadı | `nack` + requeue |
+
+Handler bir öğeyi `item.Fail(exception)` ile işaretlerse yalnızca o öğe bu tabloya göre sonuçlanır (örneğin geçersiz alıcı adresi). Handler exception fırlatırsa (örneğin DB'ye ulaşılamıyor), işaretlenmemiş bütün öğeler o exception ile sonuçlanır.
 
 Kapanışta consumer önce yeni mesaj almayı keser, işlenmekte olanlara 10 sn tanır, ancak süre dolunca onları iptal eder. Ack edilmemiş mesajlar kanal kapanınca kuyruğa döner.
 
@@ -431,17 +442,32 @@ Kapanışta consumer önce yeni mesaj almayı keser, işlenmekte olanlara 10 sn 
 
 **Pod sayısı:** API tepe yükü karşılamak zorunda: `N = ceil(8000 / (pod_kapasitesi × 0.7)) + 1`. 2 vCPU'luk pod'larla ilk tahmin 4; kesin sayı k6 ölçümüyle belirlenir. Worker'lar ise tepe yüke yetişmek zorunda değil: kampanya anında mesajlar kuyrukta birikir, worker'lar kendi hızlarında eritir. Worker'lar **ortalama yük ve kabul edilebilir gecikmeye** göre boyutlandırılır ve kuyruk derinliğine göre ölçeklenir. Lokalde her servisten 2 replica çalışır; amaç kapasite değil, eşzamanlılık tasarımının (SKIP LOCKED, lease, competing consumers) gerçekten çalıştığını göstermek.
 
-**Write amplification ve batching:** Mesaj başına işlemede arka plan, API'den daha fazla commit üretiyor (e-posta başına claim + `Sent`). İlk sürüm consumer'larda **mesaj başına** işleme yapıyor: her mesaj kendi scope'unda, paylaşılan state yok, `Sent` işaretlemesi beklemeden yapılıyor. **Consumer micro-batching'i zorunlu bir sonraki adım** (bkz. [§17](#17-yol-haritası)): claim ve işaretleme toplu yapılıp ack'ler toplu gönderilecek; iki sürüm k6 ile ölçülüp karşılaştırılacak. Relay zaten batch çalışıyor (500'lük claim, toplu confirm, toplu delete).
+**Write amplification ve batching:** Mesaj başına işlemede arka plan, API'den daha fazla commit üretiyordu: e-posta başına claim + `Sent`, fatura başına ön kontrol + upsert, durum güncellemesi başına bir commit. Sipariş başına toplam ~8 commit; bunun yalnızca 1'i API'nin. Consumer'lar artık micro-batch çalışıyor ([§11](#consumer-pipeline)): batch başına tek claim, tek `Sent` işaretlemesi, tek fatura upsert'ü, tek durum güncellemesi. Relay zaten batch çalışıyordu (500'lük claim, toplu confirm, toplu delete).
+
+Lokal ölçüm (5.000 sipariş, tek makine, her servisten bir kopya; `pg_stat_database.xact_commit` farkı):
+
+| | Mesaj başına (eski ayarlar) | Mesaj başına (batch ile aynı eşzamanlılık) | Batch (≤50, 10 ms) |
+|---|---|---|---|
+| `ordering` commit / sipariş | 2,02 | 2,02 | **1,03** (1'i API'nin kendisi) |
+| `invoicing` commit / sipariş | 2,12 | 2,04 | **0,06** |
+| `notification` commit / sipariş | 4,01 | 4,01 | **0,08** |
+| Kuyrukların boşalma süresi | 19,6 sn | 12,7 sn | **6,7 sn** |
+| Ortalama batch boyutu | 1 | 1 | fatura 49,5 · mail 50 · durum 86 |
+
+Arka plandaki commit yükü sipariş başına ~7'den ~0,2'ye indi; geriye neredeyse yalnızca API'nin kaçınılmaz commit'i kalıyor. Süre karşılaştırmasında adil olan orta sütun: mesaj başına modda eşzamanlılığı artırmak süreyi kısaltıyor ama commit sayısını değiştirmiyor. Bu ölçüm gösterge niteliğinde; asıl karşılaştırma nginx, replica'lar ve k6 ile 6. aşamada.
+
+**Ack'ler** mesaj başına gönderiliyor, `multiple=true` ile toplu değil. Birden fazla batch aynı kanalda paralel çalıştığı için `multiple=true`, başka bir batch'in henüz işlenmemiş daha küçük delivery tag'li mesajlarını da onaylardı. Ack frame'i küçük ve client tarafında beklemeye yol açmıyor; batching'in kazancı DB commit'lerinde.
 
 ## 13. Thread-safety
 
 | Bileşen | Thread-safe mi? | Kural |
 |---|---|---|
-| `DbContext` | ❌ | API'de request scope (`AddDbContextPool`); worker'da mesaj başına `IDbContextFactory`. Aynı context üzerinde paralel `await` yok, singleton'da tutulmaz |
+| `DbContext` | ❌ | API'de request scope (`AddDbContextPool`); worker'da batch başına `IDbContextFactory`. Aynı context üzerinde paralel `await` yok (batch içindeki paralel işler, mail gönderimi ve fatura üretimi, DB'ye dokunmaz; DB adımları sıralı), singleton'da tutulmaz |
+| `BatchItem` | — | Her öğeyi yalnızca bir görev işaretler; consumer sonucu handler döndükten sonra okur (`await` happens-before sağlar). Sonuç `TaskCompletionSource` ile, `RunContinuationsAsynchronously` seçeneğiyle iletilir: ack'ler dağıtıcının thread'inde çalışmaz |
 | `NpgsqlDataSource` | ✔ | Process başına tek instance |
 | RabbitMQ `IConnection` | ✔ | Process başına uzun ömürlü. **Publish ve consume için ayrı connection**: broker publisher'ı yavaşlattığında (flow control) consumer ack'leri bloklanmaz |
 | RabbitMQ `IChannel` | ⚠️ | Her consumer'ın ve her relay'in kendi kanalı var. **Ack'ler:** `ConsumerDispatchConcurrency` ile eşzamanlı çalışan handler'lar ack'i kendi consumer kanallarından gönderir; bu özellik tam olarak bu kullanım için var. **Retry/DLQ publish'leri:** client, bir kanalın eşzamanlı kullanımını belgelemediği için tek kanal üzerinden `SemaphoreSlim` ile sıralı yapılır. Bu yol yalnızca hata durumunda kullanıldığı için maliyeti ihmal edilebilir |
-| Delivery body | — | Yalnızca handler çalışırken geçerli (client belgesi). Retry/DLQ kopyası handler dönmeden yayınlanıyor |
+| Delivery body | — | Yalnızca handler çalışırken geçerli (client belgesi). Bu yüzden teslimat, batch'i bitene kadar kendi handler'ında bekler ve retry/DLQ kopyası handler dönmeden yayınlanır |
 | MailKit `SmtpClient` | ❌ | Aynı anda tek gönderim yapabilir. Eşzamanlılık kadar client içeren bounded bir pool var: client havuzdan alınır, kullanılır, geri konur. Gönderim ortasında hata alan client tekrar kullanılmaz, atılır |
 | Polly `ResiliencePipeline` | ✔ | Singleton |
 | `JsonSerializerOptions` / source-gen context | ✔ | Tek instance |
@@ -500,5 +526,5 @@ Her aşamanın sonunda birlikte gözden geçirme yapılıyor.
 - [x] **2.** BuildingBlocks + Ordering.Worker: outbox relay, RabbitMQ topolojisi, publisher confirms
 - [x] **3.** Notification.Worker: claim/lease, MailKit + Mailpit, retry/DLQ/circuit breaker
 - [x] **4.** Invoicing.Worker (upsert, kendi outbox'ı ve relay'i) + Ordering.Worker'daki fatura durumu consumer'ları
-- [ ] **5.** Consumer micro-batching (zorunlu)
+- [x] **5.** Consumer micro-batching: batch başına tek claim/upsert/update, öğe bazında sonuçlandırma, `MaxBatchSize: 1` ile mesaj başına mod
 - [ ] **6.** nginx + replica'lar, k6 (mesaj başına ve batch karşılaştırması), README ve prod notları

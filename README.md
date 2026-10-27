@@ -4,7 +4,7 @@ Yoğun trafikli bir e-ticaret platformu için sipariş yönetimi ve asenkron iş
 
 Mimari, kararlar ve trade-off'lar için: **[DESIGN.md](DESIGN.md)**
 
-> **Durum:** Uçtan uca akış tamam (Aşama 4: sipariş, e-posta, fatura). Sırada consumer batching ve yük testi var.
+> **Durum:** Uçtan uca akış ve consumer micro-batching tamam (Aşama 5). Sırada nginx + replica'larla yük testi var.
 
 ## Kapsam
 
@@ -63,6 +63,8 @@ curl -X PUT http://localhost:8025/api/v1/chaos -H 'Content-Type: application/jso
   -d '{"Recipient":{"ErrorCode":451,"Probability":30}}'
 # 550 → kalıcı hata (mail Dead olur ve mesaj DLQ'ya gider); Probability 0 → kapatır
 ```
+
+Consumer'lar varsayılan olarak batch çalışır (`Consumers:<Event>:MaxBatchSize`, appsettings'te 20–100). Karşılaştırma için mesaj başına moda ortam değişkeniyle geçilebilir, örneğin `Consumers__OrderPlaced__MaxBatchSize=1`. Bu modda `Concurrency` aynı anda işlenen mesaj sayısı olduğu için onu da artırmak gerekir (örneğin `Consumers__OrderPlaced__Concurrency=16`). Ölçüm sonuçları [DESIGN.md §12](DESIGN.md#12-performans-ve-kapasite)'de.
 
 Worker ilk açılışta RabbitMQ topolojisinin tamamını (exchange'ler, kuyruklar, retry seviyeleri, DLQ'lar) kurar. Yayınlanan mesajlar Management UI'da `invoicing.order-placed` ve `notification.order-placed` kuyruklarında görülebilir.
 
